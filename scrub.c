@@ -9,7 +9,6 @@
 #include <btrfs/ioctl.h>
 #include <btrfs/rbtree.h>
 #include <btrfs/btrfs-list.h>
-#include <blkid/blkid.h>
 #include <btrfs/ctree.h>
 #include <sys/stat.h>
 #include <sys/types.h>
