@@ -47,7 +47,7 @@ int main (int argc, char **argv) {
 		printf("%.2x", fsinfo.fsid[i]);
 	printf("\n");
 	memset(devices, -1, sizeof(devices));
-	int devices_found = 0;
+	unsigned devices_found = 0;
 	for (int i = 0; i < MAX_DEVID && devices_found < fsinfo.num_devices; i++) {
 		struct btrfs_ioctl_dev_info_args devinfo;
 		memset(&devinfo, 0, sizeof(devinfo));
