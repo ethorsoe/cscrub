@@ -49,11 +49,12 @@ static inline void set_bit(u8 *data, u32 index) {
 	data[index >> 3U] |= 1U << (index & 7U);
 }
 static inline void set_bits(u8 *data, u32 index, u32 len) {
-	while(len-- && (index % 7U)) {
+	while(len && (index & 7U)) {
 		set_bit(data, index++);
+		len--;
 	}
 	u32 bulklen = len & ~7UL;
-	memset(data, -1, bulklen >> 3U);
+	memset(data + (index >> 3U), -1, bulklen >> 3U);
 	index += bulklen;
 	len -= bulklen;
 	while(len--) {
@@ -94,6 +95,7 @@ static int search_checksum_cb(void *data, struct btrfs_ioctl_search_header *sh, 
 	int nsums = sh->len/CHECKSUMSIZE;
 	struct work_item_data *work = private;
 	unsigned start_index = (sh->offset - work->logical_offset) / getpagesize();
+	assert((start_index + nsums) * getpagesize() <= work->length);
 	memcpy(work->checksums + start_index, data, sh->len);
 	set_bits(work->bitmap, start_index, nsums);
 	return 0;
@@ -132,8 +134,8 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	memset(&key, 0 ,sizeof(key));
 	key.min_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
 	key.max_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
-	key.min_type = BTRFS_CSUM_ITEM_KEY;
-	key.max_type = BTRFS_CSUM_ITEM_KEY;
+	key.min_type = BTRFS_EXTENT_CSUM_KEY;
+	key.max_type = BTRFS_EXTENT_CSUM_KEY;
 	key.min_offset = work->logical_offset;
 	key.max_offset = work->logical_offset + work->length - 1;
 	key.max_transid = -1ULL;
