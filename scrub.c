@@ -86,12 +86,16 @@ int consumer(void *private) {
 			break;
 
 		const int iterations = (work->length + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
-		/* #pragma omp parallel for schedule(static,1) */
+		
+		u8 *device_maps[work->num_stripes];
+		u64 offset;
+		u64 len;
+		u64 readahead_len;
+#pragma omp parallel for schedule(static,1) private(device_maps, offset, len, readahead_len)
 		for (int i = 0; i < iterations; i++) {
-			u8 *device_maps[work->num_stripes];
-			u64 offset = PARALLEL_BLOCK_SIZE * i;
-			u64 len = PARALLEL_BLOCK_SIZE;
-			u64 readahead_len = PARALLEL_BLOCK_SIZE;
+			offset = PARALLEL_BLOCK_SIZE * i;
+			len = PARALLEL_BLOCK_SIZE;
+			readahead_len = PARALLEL_BLOCK_SIZE;
 			if (offset + len > work->length) {
 				len -= offset + len - work->length;
 				readahead_len = len;
