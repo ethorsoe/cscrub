@@ -26,13 +26,13 @@ int64_t btrfs_iterate_tree(int fd, uint64_t tree, void *private, int (*callback)
 	if (NULL != key) {
 		memcpy(&args->key, key, offsetof(struct btrfs_ioctl_search_args_v2,buf));
 	} else {
-		args->key.tree_id=tree;
 		args->key.max_objectid=-1ULL;
 		args->key.max_type=-1U;
 		args->key.max_offset=-1ULL;
 		args->key.max_transid=-1ULL;
-		args->buf_size=MEBI;
 	}
+	args->buf_size=MEBI;
+	args->key.tree_id=tree;
 	struct btrfs_ioctl_search_header *sh;
 	int64_t ret=0;
 
