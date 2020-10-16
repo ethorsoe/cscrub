@@ -14,13 +14,16 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <threads.h>
+#include <sys/mman.h>
 #include "libbtrfs.h"
 
+struct shared_data;
 struct work_item_data {
 	unsigned char *bitmap;
 	u32 *checksums;
 	u64 *disk_offsets;
 	int *diskfds;
+	struct shared_data *parent;
 	u64 logical_offset;
 	u64 length;
 	u64 stripe_len;
@@ -28,12 +31,12 @@ struct work_item_data {
 };
 
 struct shared_data {
+	struct btrfs_ioctl_fs_info_args fsinfo;
 	mtx_t mutex;
 	cnd_t condition;
 	int *diskfds;
 	unsigned consumer_offset;
 	unsigned producer_offset;
-	unsigned max_stripes;
 	int mountfd;
 	struct work_item_data work[2];
 };
@@ -67,6 +70,7 @@ void die(const char *msg) {
 	exit(EXIT_FAILURE);
 }
 
+#define PARALLEL_BLOCK_SIZE (4 * 1024 *1024)
 int consumer(void *private) {
 	struct shared_data *shared_data = private;
 	mtx_lock(&shared_data->mutex);
@@ -80,6 +84,30 @@ int consumer(void *private) {
 		mtx_unlock(&shared_data->mutex);
 		if (!work->num_stripes)
 			break;
+
+		const int iterations = (work->length + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
+		/* #pragma omp parallel for schedule(static,1) */
+		for (int i = 0; i < iterations; i++) {
+			u8 *device_maps[work->num_stripes];
+			u64 offset = PARALLEL_BLOCK_SIZE * i;
+			u64 len = PARALLEL_BLOCK_SIZE;
+			u64 readahead_len = PARALLEL_BLOCK_SIZE;
+			if (offset + len > work->length) {
+				len -= offset + len - work->length;
+				readahead_len = len;
+			}
+			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+				readahead(work->diskfds[stripe], work->disk_offsets[stripe] + offset, readahead_len);
+			}
+			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+				device_maps[stripe] = mmap(NULL, len, PROT_READ, MAP_SHARED|MAP_POPULATE, work->diskfds[stripe], work->disk_offsets[stripe] + offset);
+				assert(device_maps[stripe]);
+			}
+			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+				munmap(device_maps[stripe], len);
+			}
+		}
+
 		mtx_lock(&shared_data->mutex);
 		printf("consumer processed %llu\n", (unsigned long long)work->logical_offset);
 		shared_data->consumer_offset++;
@@ -94,9 +122,20 @@ static int search_checksum_cb(void *data, struct btrfs_ioctl_search_header *sh, 
 	assert(sh->len%CHECKSUMSIZE == 0);
 	int nsums = sh->len/CHECKSUMSIZE;
 	struct work_item_data *work = private;
-	unsigned start_index = (sh->offset - work->logical_offset) / getpagesize();
-	assert((start_index + nsums) * getpagesize() <= work->length);
-	memcpy(work->checksums + start_index, data, sh->len);
+	
+	int start_index = (sh->offset - work->logical_offset) / work->parent->fsinfo.sectorsize;
+	if (0 > start_index) {
+		nsums += start_index;
+		start_index = 0;
+	}
+	if (0 >= nsums)
+		return 0;
+	int spillover_items = start_index + nsums - work->length / work->parent->fsinfo.sectorsize;
+	if (0 < spillover_items) {
+		nsums -= spillover_items;		
+	}
+	assert(0 < nsums);
+	memcpy(work->checksums + start_index, data, nsums * CHECKSUMSIZE);
 	set_bits(work->bitmap, start_index, nsums);
 	return 0;
 }
@@ -116,7 +155,7 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	work->length = chunk->length;
 	work->stripe_len = chunk->stripe_len;
 	work->num_stripes = chunk->num_stripes;
-	if (shared_data->max_stripes < work->num_stripes)
+	if (shared_data->fsinfo.num_devices < work->num_stripes)
 		die("max_stripes");
 	for (unsigned i = 0; i < work->num_stripes; i++) {
 		unsigned devid = stripes[i].devid;
@@ -136,7 +175,7 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	key.max_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
 	key.min_type = BTRFS_EXTENT_CSUM_KEY;
 	key.max_type = BTRFS_EXTENT_CSUM_KEY;
-	key.min_offset = work->logical_offset;
+	key.min_offset = work->logical_offset - shared_data->fsinfo.nodesize;
 	key.max_offset = work->logical_offset + work->length - 1;
 	key.max_transid = -1ULL;
 	btrfs_iterate_tree(shared_data->mountfd, BTRFS_CSUM_TREE_OBJECTID, work, search_checksum_cb, &key);
@@ -157,17 +196,16 @@ int main (int argc, char **argv) {
 	shared_data.mountfd = open(argv[1], O_RDONLY);
 	if (0 > shared_data.mountfd)
 		die("open");
-	struct btrfs_ioctl_fs_info_args fsinfo;
-	int err = ioctl(shared_data.mountfd, BTRFS_IOC_FS_INFO, &fsinfo);
+	int err = ioctl(shared_data.mountfd, BTRFS_IOC_FS_INFO, &shared_data.fsinfo);
 	if (0 > err)
 		die("fsinfo");
 	printf("fs UUID=");
 	for (int i = 0; i < BTRFS_FSID_SIZE; i++)
-		printf("%.2x", fsinfo.fsid[i]);
+		printf("%.2x", shared_data.fsinfo.fsid[i]);
 	printf("\n");
 	memset(devices, -1, sizeof(devices));
 	unsigned devices_found = 0;
-	for (int i = 0; i < MAX_DEVID && devices_found < fsinfo.num_devices; i++) {
+	for (int i = 0; i < MAX_DEVID && devices_found < shared_data.fsinfo.num_devices; i++) {
 		struct btrfs_ioctl_dev_info_args devinfo;
 		memset(&devinfo, 0, sizeof(devinfo));
 		devinfo.devid = i;
@@ -184,21 +222,21 @@ int main (int argc, char **argv) {
 			die("open dev");
 		devices[i] = tempfd;
 	}
-	if (devices_found < fsinfo.num_devices)
+	if (devices_found < shared_data.fsinfo.num_devices)
 		die("some devices not found");
 
 	mtx_init(&shared_data.mutex, mtx_plain);
 	cnd_init(&shared_data.condition);
 	shared_data.consumer_offset = 0;
 	shared_data.producer_offset = 0;
-	shared_data.max_stripes = fsinfo.num_devices;
 	shared_data.diskfds = devices;
 	for (int i = 0; 2 > i; i++) {
-		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (fsinfo.num_devices - 1);
+		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (shared_data.fsinfo.num_devices - 1);
 		shared_data.work[i].checksums = malloc(max_checksums * sizeof(shared_data.work[i].checksums[0]));
 		shared_data.work[i].bitmap = malloc(max_checksums / CHAR_BIT);
-		shared_data.work[i].disk_offsets = malloc(fsinfo.num_devices * sizeof(shared_data.work[i].disk_offsets[0]));
-		shared_data.work[i].diskfds = malloc(fsinfo.num_devices * sizeof(shared_data.work[i].diskfds[0]));
+		shared_data.work[i].disk_offsets = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].disk_offsets[0]));
+		shared_data.work[i].diskfds = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].diskfds[0]));
+		shared_data.work[i].parent = &shared_data;
 	}
 
 	/* work */
