@@ -17,6 +17,11 @@
 #include <sys/mman.h>
 #include "libbtrfs.h"
 
+#include "crc32c.h"
+static inline u32 cscrub_crc(u8 *data, int len) {
+	return multitable_crc32c(~0U, data, len);
+}
+
 struct shared_data;
 struct work_item_data {
 	unsigned char *bitmap;
@@ -92,7 +97,8 @@ int consumer(void *private) {
 		u64 offset;
 		u64 len;
 		u64 readahead_len;
-		ssize_t sret;;
+		ssize_t sret;
+		//#define DO_MMAP 1
 #pragma omp parallel private(device_maps, offset, len, readahead_len, sret)
 		{
 #ifndef DO_MMAP
@@ -127,6 +133,9 @@ int consumer(void *private) {
 					assert(len = sret);
 				}
 #endif
+				u64 logical_offset = work->logical_offset + offset * (work->num_stripes - 1);
+				if (3 == work->num_stripes)
+					printf("crc: 0x%llx 0x%llx %x - %x %x %x\n", work->logical_offset, offset, work->checksums[logical_offset >> 12], cscrub_crc(device_maps[0], 4096), cscrub_crc(device_maps[1], 4096), cscrub_crc(device_maps[2], 4096));
 			}
 #ifndef DO_MMAP
 			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
