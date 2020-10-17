@@ -70,7 +70,7 @@ void die(const char *msg) {
 	exit(EXIT_FAILURE);
 }
 
-#define PARALLEL_BLOCK_SIZE (4 * 1024 *1024)
+#define PARALLEL_BLOCK_SIZE (4 * 1024 * 1024)
 int consumer(void *private) {
 	struct shared_data *shared_data = private;
 	mtx_lock(&shared_data->mutex);
@@ -85,31 +85,54 @@ int consumer(void *private) {
 		if (!work->num_stripes)
 			break;
 
-		const int iterations = (work->length + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
+		u64 physical_length = work->length / (work->num_stripes - 1);
+		const int iterations = (physical_length + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
 		
 		u8 *device_maps[work->num_stripes];
 		u64 offset;
 		u64 len;
 		u64 readahead_len;
-#pragma omp parallel for schedule(static,1) private(device_maps, offset, len, readahead_len)
-		for (int i = 0; i < iterations; i++) {
-			offset = PARALLEL_BLOCK_SIZE * i;
-			len = PARALLEL_BLOCK_SIZE;
-			readahead_len = PARALLEL_BLOCK_SIZE;
-			if (offset + len > work->length) {
-				len -= offset + len - work->length;
-				readahead_len = len;
-			}
+		ssize_t sret;;
+#pragma omp parallel private(device_maps, offset, len, readahead_len, sret)
+		{
+#ifndef DO_MMAP
 			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-				readahead(work->diskfds[stripe], work->disk_offsets[stripe] + offset, readahead_len);
-			}
-			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-				device_maps[stripe] = mmap(NULL, len, PROT_READ, MAP_SHARED|MAP_POPULATE, work->diskfds[stripe], work->disk_offsets[stripe] + offset);
+				device_maps[stripe] = malloc(PARALLEL_BLOCK_SIZE);
 				assert(device_maps[stripe]);
 			}
-			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-				munmap(device_maps[stripe], len);
+#endif
+#pragma omp for schedule(static,1)
+			for (int i = 0; i < iterations; i++) {
+				offset = PARALLEL_BLOCK_SIZE * i;
+				len = PARALLEL_BLOCK_SIZE;
+				readahead_len = PARALLEL_BLOCK_SIZE;
+				if (offset + len > physical_length) {
+					len -= offset + len - physical_length;
+					readahead_len = len;
+				}
+				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+					posix_fadvise(work->diskfds[stripe], work->disk_offsets[stripe] + offset, readahead_len, POSIX_FADV_WILLNEED);
+				}
+#ifdef DO_MMAP
+				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+					device_maps[stripe] = mmap(NULL, len, PROT_READ, MAP_SHARED|MAP_POPULATE, work->diskfds[stripe], work->disk_offsets[stripe] + offset);
+					assert(device_maps[stripe]);
+				}
+				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+					munmap(device_maps[stripe], len);
+				}
+#else
+				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+					sret = pread(work->diskfds[stripe], device_maps[stripe], len, work->disk_offsets[stripe] + offset);
+					assert(len = sret);
+				}
+#endif
 			}
+#ifndef DO_MMAP
+			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+				free(device_maps[stripe]);
+			}
+#endif
 		}
 
 		mtx_lock(&shared_data->mutex);
