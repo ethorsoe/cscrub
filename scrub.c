@@ -19,7 +19,7 @@
 
 #include "crc32c.h"
 static inline u32 cscrub_crc(u8 *data, int len) {
-	return multitable_crc32c(~0U, data, len);
+	return ~multitable_crc32c(~0U, data, len);
 }
 
 struct shared_data;
@@ -134,8 +134,6 @@ int consumer(void *private) {
 				}
 #endif
 				u64 logical_offset = work->logical_offset + offset * (work->num_stripes - 1);
-				if (3 == work->num_stripes)
-					printf("crc: 0x%llx 0x%llx %x - %x %x %x\n", work->logical_offset, offset, work->checksums[logical_offset >> 12], cscrub_crc(device_maps[0], 4096), cscrub_crc(device_maps[1], 4096), cscrub_crc(device_maps[2], 4096));
 			}
 #ifndef DO_MMAP
 			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
@@ -158,10 +156,12 @@ static int search_checksum_cb(void *data, struct btrfs_ioctl_search_header *sh, 
 	assert(sh->len%CHECKSUMSIZE == 0);
 	int nsums = sh->len/CHECKSUMSIZE;
 	struct work_item_data *work = private;
+	u32 *copy_data = data;
 	
 	int start_index = (sh->offset - work->logical_offset) / work->parent->fsinfo.sectorsize;
 	if (0 > start_index) {
 		nsums += start_index;
+		copy_data -= start_index;
 		start_index = 0;
 	}
 	if (0 >= nsums)
@@ -171,7 +171,7 @@ static int search_checksum_cb(void *data, struct btrfs_ioctl_search_header *sh, 
 		nsums -= spillover_items;		
 	}
 	assert(0 < nsums);
-	memcpy(work->checksums + start_index, data, nsums * CHECKSUMSIZE);
+	memcpy(work->checksums + start_index, copy_data, nsums * CHECKSUMSIZE);
 	set_bits(work->bitmap, start_index, nsums);
 	return 0;
 }
