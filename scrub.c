@@ -118,7 +118,7 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 			const u64 log_ind = (stripe_ind * log_per_phys + check_disk) * stride + (phys_ind % stride);
 			const unsigned check_table_ind = log_ind - (work->logical_offset / sector_size);
 			for (unsigned i = 0; i < sector_size; i++) {
-				parity[i] ^= rotated_buffers[check_disk][i];
+				parity[i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
 			}
 			if (get_bit(work->bitmap, check_table_ind)) {
 				parity_valid = true;
