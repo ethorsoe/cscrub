@@ -76,6 +76,68 @@ void die(const char *msg) {
 }
 
 #define PARALLEL_BLOCK_SIZE (4 * 1024 * 1024)
+void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
+	u64 pblock_log_start_ind;
+	u64 pblock_phys_len = PARALLEL_BLOCK_SIZE;
+	u8 *device_maps[work->num_stripes];
+	const unsigned log_per_phys = (work->num_stripes - 1);
+	const unsigned sector_size = work->parent->fsinfo.sectorsize;
+	unsigned phys_iterations;
+	{
+		const u64 chunk_phys_len = work->length / log_per_phys;
+		const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
+		u64 readahead_len = PARALLEL_BLOCK_SIZE;
+		pblock_log_start_ind = (work->logical_offset + pblock_phys_off * log_per_phys) / sector_size;
+
+		if (pblock_phys_off + pblock_phys_len > chunk_phys_len) {
+			pblock_phys_len -= pblock_phys_off + pblock_phys_len - chunk_phys_len;
+			readahead_len = pblock_phys_len;
+		}
+		phys_iterations = pblock_phys_len / sector_size;
+		for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+			posix_fadvise(work->diskfds[stripe], work->disk_offsets[stripe] + pblock_phys_off, readahead_len, POSIX_FADV_WILLNEED);
+		}
+		for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+			device_maps[stripe] = mmap(NULL, pblock_phys_len, PROT_READ, MAP_SHARED|MAP_POPULATE, work->diskfds[stripe], work->disk_offsets[stripe] + pblock_phys_off);
+			assert(device_maps[stripe]);
+		}
+	}
+	for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+		munmap(device_maps[stripe], pblock_phys_len);
+	}
+	const unsigned stride = work->stripe_len / sector_size;
+	//const unsigned log_per_stripe = log_per_phys * stride;
+	for (unsigned phys_ind = 0; phys_ind < phys_iterations; phys_ind++) {
+		const u64 stripe_ind = ((pblock_log_start_ind / log_per_phys) + phys_ind) / stride;
+		const unsigned stripe_rotation = stripe_ind % work->num_stripes;
+		u8 *rotated_buffers[work->num_stripes];
+		u8 parity[sector_size];
+		memset(parity, 0, sector_size);
+		for (unsigned rot_ind = 0; rot_ind < work->num_stripes; rot_ind++)
+			rotated_buffers[rot_ind] = device_maps[(rot_ind + stripe_rotation) % work->num_stripes];
+		bool parity_valid = false;
+		for (unsigned check_disk = 0; check_disk < log_per_phys; check_disk++) {
+			const u64 log_ind = (stripe_ind * log_per_phys + check_disk) * stride + (phys_ind % stride);
+			const unsigned check_table_ind = log_ind - (work->logical_offset / sector_size);
+			for (unsigned i = 0; i < sector_size; i++) {
+				parity[i] ^= rotated_buffers[check_disk][i];
+			}
+			if (get_bit(work->bitmap, check_table_ind)) {
+				parity_valid = true;
+				u32 checksum = cscrub_crc(rotated_buffers[check_disk], sector_size);
+				if (checksum != work->checksums[check_table_ind])
+					fprintf(stderr, "logical %llu wanted 0x%.8lx got 0x%.8lx\n",
+						(unsigned long long)(log_ind * sector_size),
+						(unsigned long)work->checksums[check_table_ind], (unsigned long)checksum);
+			}
+		}
+		if (parity_valid && memcmp(parity, rotated_buffers[log_per_phys], sector_size)) {
+			fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
+				(unsigned long long)(work->logical_offset),
+				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_ind * sector_size));
+		}
+	}
+}
 int consumer(void *private) {
 	struct shared_data *shared_data = private;
 	mtx_lock(&shared_data->mutex);
@@ -90,56 +152,12 @@ int consumer(void *private) {
 		if (!work->num_stripes)
 			break;
 
-		u64 physical_length = work->length / (work->num_stripes - 1);
-		const int iterations = (physical_length + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
+		const u64 physical_length = work->length / (work->num_stripes - 1);
+		const unsigned iterations = (physical_length + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
 		
-		u8 *device_maps[work->num_stripes];
-		u64 offset;
-		u64 len;
-		u64 readahead_len;
-		ssize_t sret;
-		//#define DO_MMAP 1
-#pragma omp parallel private(device_maps, offset, len, readahead_len, sret)
-		{
-#ifndef DO_MMAP
-			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-				device_maps[stripe] = malloc(PARALLEL_BLOCK_SIZE);
-				assert(device_maps[stripe]);
-			}
-#endif
-#pragma omp for schedule(static,1)
-			for (int i = 0; i < iterations; i++) {
-				offset = PARALLEL_BLOCK_SIZE * i;
-				len = PARALLEL_BLOCK_SIZE;
-				readahead_len = PARALLEL_BLOCK_SIZE;
-				if (offset + len > physical_length) {
-					len -= offset + len - physical_length;
-					readahead_len = len;
-				}
-				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-					posix_fadvise(work->diskfds[stripe], work->disk_offsets[stripe] + offset, readahead_len, POSIX_FADV_WILLNEED);
-				}
-#ifdef DO_MMAP
-				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-					device_maps[stripe] = mmap(NULL, len, PROT_READ, MAP_SHARED|MAP_POPULATE, work->diskfds[stripe], work->disk_offsets[stripe] + offset);
-					assert(device_maps[stripe]);
-				}
-				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-					munmap(device_maps[stripe], len);
-				}
-#else
-				for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-					sret = pread(work->diskfds[stripe], device_maps[stripe], len, work->disk_offsets[stripe] + offset);
-					assert(len = sret);
-				}
-#endif
-				u64 logical_offset = work->logical_offset + offset * (work->num_stripes - 1);
-			}
-#ifndef DO_MMAP
-			for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-				free(device_maps[stripe]);
-			}
-#endif
+#pragma omp parallel for schedule(static,1)
+		for (unsigned i = 0; i < iterations; i++) {
+			handle_parallel_block(work, i);
 		}
 
 		mtx_lock(&shared_data->mutex);
