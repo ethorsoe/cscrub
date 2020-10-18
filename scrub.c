@@ -105,6 +105,7 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 	const unsigned stride = work->stripe_len / sector_size;
 	//const unsigned log_per_stripe = log_per_phys * stride;
 	for (unsigned phys_ind = 0; phys_ind < phys_iterations; phys_ind++) {
+		const u64 phys_off_in_pblock = phys_ind * sector_size;
 		const u64 stripe_ind = ((pblock_log_start_ind / log_per_phys) + phys_ind) / stride;
 		const unsigned stripe_rotation = stripe_ind % work->num_stripes;
 		u8 *rotated_buffers[work->num_stripes];
@@ -121,17 +122,17 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 			}
 			if (get_bit(work->bitmap, check_table_ind)) {
 				parity_valid = true;
-				u32 checksum = cscrub_crc(rotated_buffers[check_disk], sector_size);
+				u32 checksum = cscrub_crc(rotated_buffers[check_disk] + phys_off_in_pblock, sector_size);
 				if (checksum != work->checksums[check_table_ind])
 					fprintf(stderr, "logical %llu wanted 0x%.8lx got 0x%.8lx\n",
 						(unsigned long long)(log_ind * sector_size),
 						(unsigned long)work->checksums[check_table_ind], (unsigned long)checksum);
 			}
 		}
-		if (parity_valid && memcmp(parity, rotated_buffers[log_per_phys], sector_size)) {
+		if (parity_valid && memcmp(parity, rotated_buffers[log_per_phys] + phys_off_in_pblock, sector_size)) {
 			fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
 				(unsigned long long)(work->logical_offset),
-				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_ind * sector_size));
+				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));
 		}
 	}
 	for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
