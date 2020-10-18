@@ -102,9 +102,6 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 			assert(device_maps[stripe]);
 		}
 	}
-	for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-		munmap(device_maps[stripe], pblock_phys_len);
-	}
 	const unsigned stride = work->stripe_len / sector_size;
 	//const unsigned log_per_stripe = log_per_phys * stride;
 	for (unsigned phys_ind = 0; phys_ind < phys_iterations; phys_ind++) {
@@ -136,6 +133,9 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 				(unsigned long long)(work->logical_offset),
 				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_ind * sector_size));
 		}
+	}
+	for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+		munmap(device_maps[stripe], pblock_phys_len);
 	}
 }
 int consumer(void *private) {
