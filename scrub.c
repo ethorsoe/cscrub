@@ -77,7 +77,6 @@ void die(const char *msg) {
 
 #define PARALLEL_BLOCK_SIZE (4 * 1024 * 1024)
 void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
-	u64 pblock_log_start_ind;
 	u64 pblock_phys_len = PARALLEL_BLOCK_SIZE;
 	u8 *device_maps[work->num_stripes];
 	const unsigned log_per_phys = (work->num_stripes - 1);
@@ -87,7 +86,6 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 		const u64 chunk_phys_len = work->length / log_per_phys;
 		const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
 		u64 readahead_len = PARALLEL_BLOCK_SIZE;
-		pblock_log_start_ind = (work->logical_offset + pblock_phys_off * log_per_phys) / sector_size;
 
 		if (pblock_phys_off + pblock_phys_len > chunk_phys_len) {
 			pblock_phys_len -= pblock_phys_off + pblock_phys_len - chunk_phys_len;
@@ -103,11 +101,10 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 		}
 	}
 	const unsigned stride = work->stripe_len / sector_size;
-	//const unsigned log_per_stripe = log_per_phys * stride;
 	for (unsigned phys_ind = 0; phys_ind < phys_iterations; phys_ind++) {
 		const u64 phys_off_in_pblock = phys_ind * sector_size;
-		const u64 stripe_ind = ((pblock_log_start_ind / log_per_phys) + phys_ind) / stride;
-		const unsigned stripe_rotation = stripe_ind % work->num_stripes;
+		const u64 stripe_ind_in_bg = iteration * (PARALLEL_BLOCK_SIZE / work->stripe_len) + phys_ind / stride;
+		const unsigned stripe_rotation = stripe_ind_in_bg % work->num_stripes;
 		u8 *rotated_buffers[work->num_stripes];
 		u8 parity[sector_size];
 		memset(parity, 0, sector_size);
@@ -115,18 +112,19 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 			rotated_buffers[rot_ind] = device_maps[(rot_ind + stripe_rotation) % work->num_stripes];
 		bool parity_valid = false;
 		for (unsigned check_disk = 0; check_disk < log_per_phys; check_disk++) {
-			const u64 log_ind = (stripe_ind * log_per_phys + check_disk) * stride + (phys_ind % stride);
-			const unsigned check_table_ind = log_ind - (work->logical_offset / sector_size);
+			const u64 check_table_ind = (stripe_ind_in_bg * log_per_phys + check_disk) * stride + (phys_ind % stride);
+			const unsigned long long log_off_in_fs = check_table_ind * sector_size + work->logical_offset;
 			for (unsigned i = 0; i < sector_size; i++) {
 				parity[i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
 			}
 			if (get_bit(work->bitmap, check_table_ind)) {
 				parity_valid = true;
 				u32 checksum = cscrub_crc(rotated_buffers[check_disk] + phys_off_in_pblock, sector_size);
-				if (checksum != work->checksums[check_table_ind])
+				if (checksum != work->checksums[check_table_ind]) {
 					fprintf(stderr, "logical %llu wanted 0x%.8lx got 0x%.8lx\n",
-						(unsigned long long)(log_ind * sector_size),
+						log_off_in_fs,
 						(unsigned long)work->checksums[check_table_ind], (unsigned long)checksum);
+				}
 			}
 		}
 		if (parity_valid && memcmp(parity, rotated_buffers[log_per_phys] + phys_off_in_pblock, sector_size)) {
