@@ -163,7 +163,7 @@ int consumer(void *private) {
 		} else {
 			cnd_wait(&shared_data->condition, &shared_data->mutex);
 		}
-		struct work_item_data *work = shared_data->work + (shared_data->consumer_offset % 2);
+		struct work_item_data *work = shared_data->work + (shared_data->consumer_offset % WORK_ITEM_COUNT);
 		printf("consumer processing %llu\n", (unsigned long long)work->logical_offset);
 		mtx_unlock(&shared_data->mutex);
 		if (!work->num_stripes)
@@ -235,7 +235,7 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	if (shared_data->producer_offset > shared_data->consumer_offset + 1) {
 		cnd_wait(&shared_data->condition, &shared_data->mutex);
 	}
-	struct work_item_data *work = shared_data->work + (shared_data->producer_offset % 2);
+	struct work_item_data *work = shared_data->work + (shared_data->producer_offset % WORK_ITEM_COUNT);
 	work->logical_offset = hdr->offset;
 	work->length = chunk->length;
 	work->stripe_len = chunk->stripe_len;
@@ -316,7 +316,7 @@ int main (int argc, char **argv) {
 	shared_data.consumer_offset = 0;
 	shared_data.producer_offset = 0;
 	shared_data.diskfds = devices;
-	for (int i = 0; 2 > i; i++) {
+	for (int i = 0; WORK_ITEM_COUNT > i; i++) {
 		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (shared_data.fsinfo.num_devices - 1);
 		shared_data.work[i].checksums = malloc(max_checksums * sizeof(shared_data.work[i].checksums[0]));
 		shared_data.work[i].bitmap = malloc(max_checksums / CHAR_BIT);
@@ -351,7 +351,7 @@ int main (int argc, char **argv) {
 	if (shared_data.producer_offset > shared_data.consumer_offset + 1) {
 		cnd_wait(&shared_data.condition, &shared_data.mutex);
 	}
-	struct work_item_data *work = shared_data.work + (shared_data.producer_offset % 2);
+	struct work_item_data *work = shared_data.work + (shared_data.producer_offset % WORK_ITEM_COUNT);
 	work->num_stripes = 0;
 	work->logical_offset = ULLONG_MAX;
 	shared_data.producer_offset++;
@@ -362,7 +362,7 @@ int main (int argc, char **argv) {
 	/* cleanup */
 	mtx_destroy(&shared_data.mutex);
 	cnd_destroy(&shared_data.condition);
-	for (int i = 0; 2 > i; i++) {
+	for (int i = 0; WORK_ITEM_COUNT > i; i++) {
 		free(shared_data.work[i].checksums);
 		free(shared_data.work[i].bitmap);
 		free(shared_data.work[i].disk_offsets);
