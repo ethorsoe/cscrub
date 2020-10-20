@@ -25,6 +25,13 @@ static inline u32 cscrub_crc(u8 *data, int len) {
 	return ~multitable_crc32c(~0U, data, len);
 }
 
+#define WORK_ITEM_COUNT 2
+#define PARITY_STRIPE_COUNT 1
+#define MAX_DEVID 1024
+#define CHECKSUMSIZE 4
+#define MAX_CHECKSUMS_PER_STRIPE (1ULL << 18)
+#define PARALLEL_BLOCK_SIZE (4 * 1024 * 1024)
+
 struct scrub_io_ctx {
 	io_context_t ctxp;
 	u8 **disk_buffers;
@@ -52,12 +59,9 @@ struct shared_data {
 	unsigned consumer_offset;
 	unsigned producer_offset;
 	int mountfd;
-	struct work_item_data work[2];
+	struct work_item_data work[WORK_ITEM_COUNT];
 };
 
-#define MAX_DEVID 1024
-#define CHECKSUMSIZE 4
-#define MAX_CHECKSUMS_PER_STRIPE (1ULL << 18)
 
 static inline int get_bit(const u8 *data, u32 index) {
 	return (data[index >> 3U] >> (index & 7U)) & 1U;
@@ -84,77 +88,75 @@ void die(const char *msg) {
 	exit(EXIT_FAILURE);
 }
 
-#define PARALLEL_BLOCK_SIZE (4 * 1024 * 1024)
-void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
-	u64 pblock_phys_len = PARALLEL_BLOCK_SIZE;
-	u8 *device_maps[work->num_stripes];
-	struct scrub_io_ctx *ctx = work->io_contexts + omp_get_thread_num();
+void check_parallel_block(struct work_item_data *work, unsigned iteration, unsigned phys_ind) {
+	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % WORK_ITEM_COUNT);
 	const unsigned log_per_phys = (work->num_stripes - 1);
 	const unsigned sector_size = work->parent->fsinfo.sectorsize;
-	unsigned phys_iterations;
-	s64 err;
-	{
-		struct iocb iocbs[work->num_stripes];
-		struct io_event io_events[work->num_stripes];
-		struct iocb *iocbsp;
-		const u64 chunk_phys_len = work->length / log_per_phys;
-		const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
-
-		memset(iocbs, 0, sizeof(iocbs));
-		memset(io_events, 0, sizeof(io_events));
-		if (pblock_phys_off + pblock_phys_len > chunk_phys_len) {
-			pblock_phys_len -= pblock_phys_off + pblock_phys_len - chunk_phys_len;
+	const unsigned stride = work->stripe_len / sector_size;
+	const u64 phys_off_in_pblock = phys_ind * sector_size;
+	const u64 stripe_ind_in_bg = iteration * (PARALLEL_BLOCK_SIZE / work->stripe_len) + phys_ind / stride;
+	const unsigned stripe_rotation = stripe_ind_in_bg % work->num_stripes;
+	u8 *rotated_buffers[work->num_stripes];
+	u8 parity[sector_size];
+	memset(parity, 0, sector_size);
+	for (unsigned rot_ind = 0; rot_ind < work->num_stripes; rot_ind++)
+		rotated_buffers[rot_ind] = ctx->disk_buffers[(rot_ind + stripe_rotation) % work->num_stripes];
+	bool parity_valid = false;
+	for (unsigned check_disk = 0; check_disk < log_per_phys; check_disk++) {
+		const u64 check_table_ind = (stripe_ind_in_bg * log_per_phys + check_disk) * stride + (phys_ind % stride);
+		const unsigned long long log_off_in_fs = check_table_ind * sector_size + work->logical_offset;
+		for (unsigned i = 0; i < sector_size; i++) {
+			parity[i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
 		}
-		phys_iterations = pblock_phys_len / sector_size;
-		for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-			iocbsp = iocbs + stripe;
-			device_maps[stripe] = ctx->disk_buffers[stripe];
-			io_prep_pread(iocbsp, work->diskfds[stripe], device_maps[stripe], pblock_phys_len, work->disk_offsets[stripe] + pblock_phys_off);
-			err = io_submit(ctx->ctxp, 1, &iocbsp);
-			assert(1 == err);
-		}
-		err = io_getevents(ctx->ctxp, work->num_stripes, work->num_stripes, io_events, NULL);
-		assert(err == work->num_stripes);
-		for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-			assert(pblock_phys_len == io_events[stripe].res);
+		if (get_bit(work->bitmap, check_table_ind)) {
+			parity_valid = true;
+			u32 checksum = cscrub_crc(rotated_buffers[check_disk] + phys_off_in_pblock, sector_size);
+			if (checksum != work->checksums[check_table_ind]) {
+				fprintf(stderr, "logical %llu wanted 0x%.8lx got 0x%.8lx\n",
+					log_off_in_fs,
+					(unsigned long)work->checksums[check_table_ind], (unsigned long)checksum);
+			}
 		}
 	}
-	const unsigned stride = work->stripe_len / sector_size;
-	for (unsigned phys_ind = 0; phys_ind < phys_iterations; phys_ind++) {
-		const u64 phys_off_in_pblock = phys_ind * sector_size;
-		const u64 stripe_ind_in_bg = iteration * (PARALLEL_BLOCK_SIZE / work->stripe_len) + phys_ind / stride;
-		const unsigned stripe_rotation = stripe_ind_in_bg % work->num_stripes;
-		u8 *rotated_buffers[work->num_stripes];
-		u8 parity[sector_size];
-		memset(parity, 0, sector_size);
-		for (unsigned rot_ind = 0; rot_ind < work->num_stripes; rot_ind++)
-			rotated_buffers[rot_ind] = device_maps[(rot_ind + stripe_rotation) % work->num_stripes];
-		bool parity_valid = false;
-		for (unsigned check_disk = 0; check_disk < log_per_phys; check_disk++) {
-			const u64 check_table_ind = (stripe_ind_in_bg * log_per_phys + check_disk) * stride + (phys_ind % stride);
-			const unsigned long long log_off_in_fs = check_table_ind * sector_size + work->logical_offset;
-			for (unsigned i = 0; i < sector_size; i++) {
-				parity[i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
-			}
-			if (get_bit(work->bitmap, check_table_ind)) {
-				parity_valid = true;
-				u32 checksum = cscrub_crc(rotated_buffers[check_disk] + phys_off_in_pblock, sector_size);
-				if (checksum != work->checksums[check_table_ind]) {
-					fprintf(stderr, "logical %llu wanted 0x%.8lx got 0x%.8lx\n",
-						log_off_in_fs,
-						(unsigned long)work->checksums[check_table_ind], (unsigned long)checksum);
-				}
-			}
-		}
-		if (parity_valid && memcmp(parity, rotated_buffers[log_per_phys] + phys_off_in_pblock, sector_size)) {
-			fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
-				(unsigned long long)(work->logical_offset),
-				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));
-		}
+	if (parity_valid && memcmp(parity, rotated_buffers[log_per_phys] + phys_off_in_pblock, sector_size)) {
+		fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
+			(unsigned long long)(work->logical_offset),
+			(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));
+	}
+}
+void start_read_parallel_block(struct work_item_data *work, unsigned iteration) {
+	const unsigned log_per_phys = (work->num_stripes - 1);
+	const u64 chunk_phys_len = work->length / log_per_phys;
+	const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
+	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % WORK_ITEM_COUNT);
+	struct iocb iocbs[work->num_stripes];
+	struct iocb *iocbsp;
+
+	u64 pblock_phys_len = PARALLEL_BLOCK_SIZE;
+	if (pblock_phys_off + pblock_phys_len > chunk_phys_len) {
+		pblock_phys_len -= pblock_phys_off + pblock_phys_len - chunk_phys_len;
+	}
+	memset(iocbs, 0, sizeof(iocbs));
+	for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
+		iocbsp = iocbs + stripe;
+		io_prep_pread(iocbsp, work->diskfds[stripe], ctx->disk_buffers[stripe], pblock_phys_len, work->disk_offsets[stripe] + pblock_phys_off);
+		s64 err = io_submit(ctx->ctxp, 1, &iocbsp);
+		assert(1 == err);
+	}
+}
+void end_read_parallel_block(io_context_t ctxp, unsigned num_stripes, unsigned pblock_phys_len) {
+	struct io_event io_events[num_stripes];
+
+	memset(io_events, 0, sizeof(io_events));
+	s64 err = io_getevents(ctxp, num_stripes, num_stripes, io_events, NULL);
+	assert(err == num_stripes);
+	for (unsigned stripe = 0; stripe < num_stripes; stripe++) {
+		assert(pblock_phys_len == io_events[stripe].res);
 	}
 }
 int consumer(void *private) {
 	struct shared_data *shared_data = private;
+	const unsigned sector_size = shared_data->fsinfo.sectorsize;
 	mtx_lock(&shared_data->mutex);
 	while(1) {
 		if (shared_data->producer_offset > shared_data->consumer_offset) {
@@ -167,12 +169,26 @@ int consumer(void *private) {
 		if (!work->num_stripes)
 			break;
 
-		const u64 physical_length = work->length / (work->num_stripes - 1);
-		const unsigned iterations = (physical_length + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
+		const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
+		const u64 chunk_phys_len = work->length / log_per_phys;
+		const unsigned iterations = (chunk_phys_len + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
 		
+		start_read_parallel_block(work, 0);
+		for (unsigned iteration = 0; iteration < iterations; iteration++) {
+			const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
+			u64 pblock_phys_len = PARALLEL_BLOCK_SIZE;
+			if (pblock_phys_off + pblock_phys_len > chunk_phys_len) {
+				pblock_phys_len -= pblock_phys_off + pblock_phys_len - chunk_phys_len;
+			}
+			const unsigned phys_iterations = pblock_phys_len / sector_size;
+			end_read_parallel_block((work->io_contexts + iteration % WORK_ITEM_COUNT)->ctxp, work->num_stripes, pblock_phys_len);
+			if (iteration + 1 < iterations) {
+				start_read_parallel_block(work, iteration + 1);
+			}
 #pragma omp parallel for schedule(static,1)
-		for (unsigned i = 0; i < iterations; i++) {
-			handle_parallel_block(work, i);
+			for (unsigned phys_ind = 0; phys_ind < phys_iterations; phys_ind++) {
+				check_parallel_block(work, iteration, phys_ind);
+			}
 		}
 
 		mtx_lock(&shared_data->mutex);
