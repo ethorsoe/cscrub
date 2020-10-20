@@ -26,6 +26,7 @@ static inline u32 cscrub_crc(u8 *data, int len) {
 }
 
 #define WORK_ITEM_COUNT 2
+#define CSCRUB_AIO_INTERLEAVE_STAGES 2
 #define PARITY_STRIPE_COUNT 1
 #define MAX_DEVID 1024
 #define CHECKSUMSIZE 4
@@ -89,7 +90,7 @@ void die(const char *msg) {
 }
 
 void check_parallel_block(struct work_item_data *work, unsigned iteration, unsigned phys_ind) {
-	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % WORK_ITEM_COUNT);
+	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % CSCRUB_AIO_INTERLEAVE_STAGES);
 	const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
 	const unsigned sector_size = work->parent->fsinfo.sectorsize;
 	const unsigned stride = work->stripe_len / sector_size;
@@ -128,7 +129,7 @@ void start_read_parallel_block(struct work_item_data *work, unsigned iteration) 
 	const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
 	const u64 chunk_phys_len = work->length / log_per_phys;
 	const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
-	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % WORK_ITEM_COUNT);
+	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % CSCRUB_AIO_INTERLEAVE_STAGES);
 	struct iocb iocbs[work->num_stripes];
 	struct iocb *iocbsp;
 
@@ -181,7 +182,7 @@ int consumer(void *private) {
 				pblock_phys_len -= pblock_phys_off + pblock_phys_len - chunk_phys_len;
 			}
 			const unsigned phys_iterations = pblock_phys_len / sector_size;
-			end_read_parallel_block((work->io_contexts + iteration % WORK_ITEM_COUNT)->ctxp, work->num_stripes, pblock_phys_len);
+			end_read_parallel_block((work->io_contexts + iteration % CSCRUB_AIO_INTERLEAVE_STAGES)->ctxp, work->num_stripes, pblock_phys_len);
 			if (iteration + 1 < iterations) {
 				start_read_parallel_block(work, iteration + 1);
 			}
@@ -323,13 +324,13 @@ int main (int argc, char **argv) {
 		shared_data.work[i].disk_offsets = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].disk_offsets[0]));
 		shared_data.work[i].diskfds = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].diskfds[0]));
 		shared_data.work[i].parent = &shared_data;
-		shared_data.work[i].io_contexts = calloc(omp_threads, sizeof(shared_data.work[i].io_contexts[0]));
+		shared_data.work[i].io_contexts = calloc(CSCRUB_AIO_INTERLEAVE_STAGES, sizeof(shared_data.work[i].io_contexts[0]));
 		assert(shared_data.work[i].io_contexts);
-		shared_data.work[i].io_contexts[0].disk_buffers = malloc(omp_threads * shared_data.fsinfo.num_devices * sizeof(u8*));
+		shared_data.work[i].io_contexts[0].disk_buffers = malloc(CSCRUB_AIO_INTERLEAVE_STAGES * shared_data.fsinfo.num_devices * sizeof(u8*));
 		assert(shared_data.work[i].io_contexts[0].disk_buffers);
-		err = posix_memalign((void**)shared_data.work[i].io_contexts[0].disk_buffers, sysconf(_SC_PAGESIZE), omp_threads * shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8));
+		err = posix_memalign((void**)shared_data.work[i].io_contexts[0].disk_buffers, sysconf(_SC_PAGESIZE), CSCRUB_AIO_INTERLEAVE_STAGES * shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8));
 		assert(!err);
-		for (unsigned io_context = 0; io_context < omp_threads; io_context++) {
+		for (unsigned io_context = 0; io_context < CSCRUB_AIO_INTERLEAVE_STAGES; io_context++) {
 			err = io_setup(shared_data.fsinfo.num_devices, &shared_data.work[i].io_contexts[io_context].ctxp);
 			assert(!err);
 			shared_data.work[i].io_contexts[io_context].disk_buffers =
@@ -369,7 +370,7 @@ int main (int argc, char **argv) {
 		free(shared_data.work[i].diskfds);
 		free(shared_data.work[i].io_contexts[0].disk_buffers[0]);
 		free(shared_data.work[i].io_contexts[0].disk_buffers);
-		for (unsigned io_context = 0; io_context < omp_threads; io_context++) {
+		for (unsigned io_context = 0; io_context < CSCRUB_AIO_INTERLEAVE_STAGES; io_context++) {
 			io_destroy(shared_data.work[i].io_contexts[io_context].ctxp);
 		}
 		free(shared_data.work[i].io_contexts);
