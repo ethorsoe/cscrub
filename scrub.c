@@ -90,7 +90,7 @@ void die(const char *msg) {
 
 void check_parallel_block(struct work_item_data *work, unsigned iteration, unsigned phys_ind) {
 	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % WORK_ITEM_COUNT);
-	const unsigned log_per_phys = (work->num_stripes - 1);
+	const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
 	const unsigned sector_size = work->parent->fsinfo.sectorsize;
 	const unsigned stride = work->stripe_len / sector_size;
 	const u64 phys_off_in_pblock = phys_ind * sector_size;
@@ -125,7 +125,7 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 	}
 }
 void start_read_parallel_block(struct work_item_data *work, unsigned iteration) {
-	const unsigned log_per_phys = (work->num_stripes - 1);
+	const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
 	const u64 chunk_phys_len = work->length / log_per_phys;
 	const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
 	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % WORK_ITEM_COUNT);
@@ -252,7 +252,7 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	printf("chunk %lld type %lld\n", (long long)hdr->offset, (long long)chunk->type);
 	mtx_unlock(&shared_data->mutex);
 
-	unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (work->num_stripes - 1);
+	unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (work->num_stripes - PARITY_STRIPE_COUNT);
 	memset(work->bitmap, 0, max_checksums / CHAR_BIT);
 	struct btrfs_ioctl_search_key key;
 	memset(&key, 0 ,sizeof(key));
@@ -317,7 +317,7 @@ int main (int argc, char **argv) {
 	shared_data.producer_offset = 0;
 	shared_data.diskfds = devices;
 	for (int i = 0; WORK_ITEM_COUNT > i; i++) {
-		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (shared_data.fsinfo.num_devices - 1);
+		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (shared_data.fsinfo.num_devices - PARITY_STRIPE_COUNT);
 		shared_data.work[i].checksums = malloc(max_checksums * sizeof(shared_data.work[i].checksums[0]));
 		shared_data.work[i].bitmap = malloc(max_checksums / CHAR_BIT);
 		shared_data.work[i].disk_offsets = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].disk_offsets[0]));
