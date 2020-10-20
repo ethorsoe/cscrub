@@ -152,9 +152,6 @@ void handle_parallel_block(struct work_item_data *work, unsigned iteration) {
 				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));
 		}
 	}
-	for (unsigned stripe = 0; stripe < work->num_stripes; stripe++) {
-		munmap(device_maps[stripe], pblock_phys_len);
-	}
 }
 int consumer(void *private) {
 	struct shared_data *shared_data = private;
@@ -261,6 +258,7 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 }
 
 int main (int argc, char **argv) {
+	const unsigned omp_threads = omp_get_max_threads();
 	int devices[MAX_DEVID]; 
 	if (argc != 2)
 		die("usage: aa <filename>");
@@ -274,7 +272,7 @@ int main (int argc, char **argv) {
 	printf("fs UUID=");
 	for (int i = 0; i < BTRFS_FSID_SIZE; i++)
 		printf("%.2x", shared_data.fsinfo.fsid[i]);
-	printf("\n");
+	printf(", %d threads\n", omp_threads);
 	memset(devices, -1, sizeof(devices));
 	unsigned devices_found = 0;
 	for (int i = 0; i < MAX_DEVID && devices_found < shared_data.fsinfo.num_devices; i++) {
@@ -302,7 +300,6 @@ int main (int argc, char **argv) {
 	shared_data.consumer_offset = 0;
 	shared_data.producer_offset = 0;
 	shared_data.diskfds = devices;
-	const unsigned omp_threads = omp_get_max_threads();
 	for (int i = 0; 2 > i; i++) {
 		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (shared_data.fsinfo.num_devices - 1);
 		shared_data.work[i].checksums = malloc(max_checksums * sizeof(shared_data.work[i].checksums[0]));
@@ -311,13 +308,18 @@ int main (int argc, char **argv) {
 		shared_data.work[i].diskfds = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].diskfds[0]));
 		shared_data.work[i].parent = &shared_data;
 		shared_data.work[i].io_contexts = calloc(omp_threads, sizeof(shared_data.work[i].io_contexts[0]));
+		assert(shared_data.work[i].io_contexts);
+		shared_data.work[i].io_contexts[0].disk_buffers = malloc(omp_threads * shared_data.fsinfo.num_devices * sizeof(u8*));
+		assert(shared_data.work[i].io_contexts[0].disk_buffers);
+		err = posix_memalign((void**)shared_data.work[i].io_contexts[0].disk_buffers, sysconf(_SC_PAGESIZE), omp_threads * shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8));
+		assert(!err);
 		for (unsigned io_context = 0; io_context < omp_threads; io_context++) {
 			err = io_setup(shared_data.fsinfo.num_devices, &shared_data.work[i].io_contexts[io_context].ctxp);
 			assert(!err);
-			shared_data.work[i].io_contexts[io_context].disk_buffers = malloc(shared_data.fsinfo.num_devices * sizeof(u8*));
-			assert(shared_data.work[i].io_contexts[io_context].disk_buffers);
-			err = posix_memalign((void**)shared_data.work[i].io_contexts[io_context].disk_buffers, sysconf(_SC_PAGESIZE), shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8));
-			assert(!err);
+			shared_data.work[i].io_contexts[io_context].disk_buffers =
+				shared_data.work[i].io_contexts[0].disk_buffers + io_context * shared_data.fsinfo.num_devices;
+			shared_data.work[i].io_contexts[io_context].disk_buffers[0] =
+				shared_data.work[i].io_contexts[0].disk_buffers[0] + io_context * shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE;
 			for (unsigned disk = 1; disk < shared_data.fsinfo.num_devices; disk++)
 				shared_data.work[i].io_contexts[io_context].disk_buffers[disk] = shared_data.work[i].io_contexts[io_context].disk_buffers[0] + disk * PARALLEL_BLOCK_SIZE;
 		}
@@ -349,10 +351,10 @@ int main (int argc, char **argv) {
 		free(shared_data.work[i].bitmap);
 		free(shared_data.work[i].disk_offsets);
 		free(shared_data.work[i].diskfds);
+		free(shared_data.work[i].io_contexts[0].disk_buffers[0]);
+		free(shared_data.work[i].io_contexts[0].disk_buffers);
 		for (unsigned io_context = 0; io_context < omp_threads; io_context++) {
 			io_destroy(shared_data.work[i].io_contexts[io_context].ctxp);
-			free(shared_data.work[i].io_contexts[io_context].disk_buffers[0]);
-			free(shared_data.work[i].io_contexts[io_context].disk_buffers);
 		}
 		free(shared_data.work[i].io_contexts);
 	}
