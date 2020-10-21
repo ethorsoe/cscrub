@@ -33,6 +33,7 @@ static inline u32 cscrub_crc(u8 *data, int len) {
 #define CHECKSUMSIZE 4
 #define MAX_CHECKSUMS_PER_STRIPE (1ULL << 18)
 #define PARALLEL_BLOCK_SIZE (4 * 1024 * 1024)
+#define CHECKSUM_SPACE_IN_META_NODE 0x20
 
 struct scrub_io_ctx {
 	io_context_t ctxp;
@@ -126,7 +127,10 @@ static inline unsigned get_parity_stripes(u32 type) {
 void check_parallel_block(struct work_item_data *work, unsigned iteration, unsigned phys_ind) {
 	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % CSCRUB_AIO_INTERLEAVE_STAGES);
 	const unsigned log_per_phys = (work->num_stripes - get_parity_stripes(work->type));
-	const unsigned sector_size = work->parent->fsinfo.sectorsize;
+	const unsigned meta_space = (BTRFS_BLOCK_GROUP_DATA & work->type) ?
+		0 : CHECKSUM_SPACE_IN_META_NODE;
+	const unsigned sector_size = (meta_space) ?
+		work->parent->fsinfo.sectorsize : work->parent->fsinfo.nodesize;
 	const unsigned stride = work->stripe_len / sector_size;
 	const u64 phys_off_in_pblock = phys_ind * sector_size;
 	const u64 stripe_ind_in_bg = iteration * (PARALLEL_BLOCK_SIZE / work->stripe_len) + phys_ind / stride;
@@ -151,11 +155,14 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 		}
 		if (get_bit(work->bitmap, check_table_ind)) {
 			parity_valid = true;
-			u32 checksum = cscrub_crc(rotated_buffers[check_disk] + phys_off_in_pblock, sector_size);
-			if (checksum != work->checksums[check_table_ind]) {
+			u8 *block_start = rotated_buffers[check_disk] + phys_off_in_pblock;
+			u32 wanted_checksum = meta_space ?
+				(*(u32*)block_start) : work->checksums[check_table_ind];
+			u32 checksum = cscrub_crc(block_start + meta_space, sector_size - meta_space);
+			if (checksum != wanted_checksum) {
 				fprintf(stderr, "logical %llu wanted 0x%.8lx got 0x%.8lx\n",
 					log_off_in_fs,
-					(unsigned long)work->checksums[check_table_ind], (unsigned long)checksum);
+					(unsigned long)wanted_checksum, (unsigned long)checksum);
 			}
 		}
 	}
@@ -202,7 +209,6 @@ void end_read_parallel_block(io_context_t ctxp, unsigned num_stripes, unsigned p
 }
 int consumer(void *private) {
 	struct shared_data *shared_data = private;
-	const unsigned sector_size = shared_data->fsinfo.sectorsize;
 	mtx_lock(&shared_data->mutex);
 	while(1) {
 		if (shared_data->producer_offset > shared_data->consumer_offset) {
@@ -215,6 +221,8 @@ int consumer(void *private) {
 		if (!work->num_stripes)
 			break;
 
+		const unsigned sector_size = (BTRFS_BLOCK_GROUP_DATA & work->type) ?
+			shared_data->fsinfo.sectorsize : shared_data->fsinfo.nodesize;
 		const unsigned log_per_phys = (work->num_stripes - get_parity_stripes(work->type));
 		const u64 chunk_phys_len = work->length / log_per_phys;
 		const unsigned iterations = (chunk_phys_len + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
@@ -270,12 +278,23 @@ static int search_checksum_cb(void *data, struct btrfs_ioctl_search_header *sh, 
 	set_bits(work->bitmap, start_index, nsums);
 	return 0;
 }
-
+static int search_meta_extent_cb(void *data, struct btrfs_ioctl_search_header *sh, void *private) {
+	(void)data;
+	struct work_item_data *work = private;
+	if (BTRFS_METADATA_ITEM_KEY != sh->type)
+		return 0;
+	
+	assert(sh->objectid < work->logical_offset + work->length);
+	assert(sh->objectid >= work->logical_offset);
+	set_bit(work->bitmap,
+		(sh->objectid - work->logical_offset) / work->parent->fsinfo.nodesize);
+	return 0;
+}
 int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *private){
 	struct btrfs_chunk *chunk = data;
 	struct shared_data *shared_data = private;
 
-	if (BTRFS_CHUNK_ITEM_KEY != hdr->type || !(chunk->type & BTRFS_BLOCK_GROUP_DATA))
+	if (BTRFS_CHUNK_ITEM_KEY != hdr->type)
 		return 0;
 	if ((chunk->type & BTRFS_BLOCK_GROUP_PROFILE_MASK) &
 			~(BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID1 |
@@ -283,7 +302,8 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 			BTRFS_BLOCK_GROUP_RAID1C3 | BTRFS_BLOCK_GROUP_RAID1C4)) {
 		return 0;
 	}
-	
+
+	const bool is_data = chunk->type & BTRFS_BLOCK_GROUP_DATA;
 	struct btrfs_stripe *stripes = &chunk->stripe;
 	mtx_lock(&shared_data->mutex);
 	if (shared_data->producer_offset > shared_data->consumer_offset + 1) {
@@ -310,16 +330,30 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 
 	unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (work->num_stripes - get_parity_stripes(work->type));
 	memset(work->bitmap, 0, max_checksums / CHAR_BIT);
-	struct btrfs_ioctl_search_key key;
-	memset(&key, 0 ,sizeof(key));
-	key.min_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
-	key.max_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
-	key.min_type = BTRFS_EXTENT_CSUM_KEY;
-	key.max_type = BTRFS_EXTENT_CSUM_KEY;
-	key.min_offset = work->logical_offset - shared_data->fsinfo.nodesize;
-	key.max_offset = work->logical_offset + work->length - 1;
-	key.max_transid = -1ULL;
-	btrfs_iterate_tree(shared_data->mountfd, BTRFS_CSUM_TREE_OBJECTID, work, search_checksum_cb, &key);
+	if (is_data) {
+		struct btrfs_ioctl_search_key key;
+		memset(&key, 0 ,sizeof(key));
+		key.min_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
+		key.max_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
+		key.min_type = BTRFS_EXTENT_CSUM_KEY;
+		key.max_type = BTRFS_EXTENT_CSUM_KEY;
+		key.min_offset = work->logical_offset - shared_data->fsinfo.nodesize;
+		key.max_offset = work->logical_offset + work->length - 1;
+		key.max_transid = -1ULL;
+		btrfs_iterate_tree(shared_data->mountfd, BTRFS_CSUM_TREE_OBJECTID, work, search_checksum_cb, &key);
+	} else {
+		struct btrfs_ioctl_search_key key;
+		memset(&key, 0 ,sizeof(key));
+		key.min_objectid = work->logical_offset;
+		key.max_objectid = work->logical_offset + work->length - 1;
+		key.min_type = BTRFS_METADATA_ITEM_KEY;
+		key.max_type = BTRFS_METADATA_ITEM_KEY;
+		key.min_offset = 0;
+		key.max_offset = -1ULL;
+		key.max_transid = -1ULL;
+		btrfs_iterate_tree(shared_data->mountfd, BTRFS_EXTENT_TREE_OBJECTID,
+			work, search_meta_extent_cb, &key);
+	}
 
 	mtx_lock(&shared_data->mutex);
 	printf("submitted chunk %lld type %lld\n", (long long)hdr->offset, (long long)chunk->type);
