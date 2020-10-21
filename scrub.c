@@ -27,7 +27,6 @@ static inline u32 cscrub_crc(u8 *data, int len) {
 
 #define WORK_ITEM_COUNT 2
 #define CSCRUB_AIO_INTERLEAVE_STAGES 2
-#define PARITY_STRIPE_COUNT 1
 #define MAX_DEVID 1024
 #define CHECKSUMSIZE 4
 #define MAX_CHECKSUMS_PER_STRIPE (1ULL << 18)
@@ -50,6 +49,7 @@ struct work_item_data {
 	u64 length;
 	u64 stripe_len;
 	u32 num_stripes;
+	u32 type;
 };
 
 struct shared_data {
@@ -89,9 +89,23 @@ void die(const char *msg) {
 	exit(EXIT_FAILURE);
 }
 
+static inline unsigned get_parity_stripes(u32 type) {
+	if (!(type & BTRFS_BLOCK_GROUP_PROFILE_MASK)) {
+		return 0;
+	} else if (type & (BTRFS_BLOCK_GROUP_RAID5|BTRFS_BLOCK_GROUP_RAID1|BTRFS_BLOCK_GROUP_DUP)) {
+		return 1;
+	} else if (type & (BTRFS_BLOCK_GROUP_RAID6|BTRFS_BLOCK_GROUP_RAID1C3)) {
+		return 2;
+	} else if (type & BTRFS_BLOCK_GROUP_RAID1C4) {
+		return 3;
+	}
+	die("Internal error, invalid block group accepted");
+	return -1;
+}
+
 void check_parallel_block(struct work_item_data *work, unsigned iteration, unsigned phys_ind) {
 	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % CSCRUB_AIO_INTERLEAVE_STAGES);
-	const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
+	const unsigned log_per_phys = (work->num_stripes - get_parity_stripes(work->type));
 	const unsigned sector_size = work->parent->fsinfo.sectorsize;
 	const unsigned stride = work->stripe_len / sector_size;
 	const u64 phys_off_in_pblock = phys_ind * sector_size;
@@ -106,6 +120,9 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 	for (unsigned check_disk = 0; check_disk < log_per_phys; check_disk++) {
 		const u64 check_table_ind = (stripe_ind_in_bg * log_per_phys + check_disk) * stride + (phys_ind % stride);
 		const unsigned long long log_off_in_fs = check_table_ind * sector_size + work->logical_offset;
+
+		// TODO add raid6 algebra here, others should just work
+		assert(!(BTRFS_BLOCK_GROUP_RAID6 & work->type));
 		for (unsigned i = 0; i < sector_size; i++) {
 			parity[i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
 		}
@@ -119,14 +136,18 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 			}
 		}
 	}
-	if (parity_valid && memcmp(parity, rotated_buffers[log_per_phys] + phys_off_in_pblock, sector_size)) {
-		fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
-			(unsigned long long)(work->logical_offset),
-			(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));
+	// TODO add raid6 algebra here, others should just work
+	assert(!(BTRFS_BLOCK_GROUP_RAID6 & work->type));
+	for (unsigned stripe = log_per_phys; parity_valid && log_per_phys < work->num_stripes; stripe++) {
+		if (memcmp(parity, rotated_buffers[stripe] + phys_off_in_pblock, sector_size)) {
+			fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
+				(unsigned long long)(work->logical_offset),
+				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));
+		}
 	}
 }
 void start_read_parallel_block(struct work_item_data *work, unsigned iteration) {
-	const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
+	const unsigned log_per_phys = (work->num_stripes - get_parity_stripes(work->type));
 	const u64 chunk_phys_len = work->length / log_per_phys;
 	const u64 pblock_phys_off = PARALLEL_BLOCK_SIZE * iteration;
 	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % CSCRUB_AIO_INTERLEAVE_STAGES);
@@ -170,7 +191,7 @@ int consumer(void *private) {
 		if (!work->num_stripes)
 			break;
 
-		const unsigned log_per_phys = (work->num_stripes - PARITY_STRIPE_COUNT);
+		const unsigned log_per_phys = (work->num_stripes - get_parity_stripes(work->type));
 		const u64 chunk_phys_len = work->length / log_per_phys;
 		const unsigned iterations = (chunk_phys_len + PARALLEL_BLOCK_SIZE - 1) / PARALLEL_BLOCK_SIZE;
 		
@@ -229,8 +250,16 @@ static int search_checksum_cb(void *data, struct btrfs_ioctl_search_header *sh, 
 int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *private){
 	struct btrfs_chunk *chunk = data;
 	struct shared_data *shared_data = private;
-	if (BTRFS_CHUNK_ITEM_KEY != hdr->type || chunk->type != (BTRFS_BLOCK_GROUP_DATA|BTRFS_BLOCK_GROUP_RAID5))
+
+	if (BTRFS_CHUNK_ITEM_KEY != hdr->type || !(chunk->type & BTRFS_BLOCK_GROUP_DATA))
 		return 0;
+	if ((chunk->type & BTRFS_BLOCK_GROUP_PROFILE_MASK) &
+			~(BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID1 |
+			BTRFS_BLOCK_GROUP_DUP | BTRFS_BLOCK_GROUP_RAID6 |
+			BTRFS_BLOCK_GROUP_RAID1C3 | BTRFS_BLOCK_GROUP_RAID1C4)) {
+		return 0;
+	}
+	
 	struct btrfs_stripe *stripes = &chunk->stripe;
 	mtx_lock(&shared_data->mutex);
 	if (shared_data->producer_offset > shared_data->consumer_offset + 1) {
@@ -241,6 +270,7 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	work->length = chunk->length;
 	work->stripe_len = chunk->stripe_len;
 	work->num_stripes = chunk->num_stripes;
+	work->type = chunk->type;
 	if (shared_data->fsinfo.num_devices < work->num_stripes)
 		die("max_stripes");
 	for (unsigned i = 0; i < work->num_stripes; i++) {
@@ -253,7 +283,7 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	printf("chunk %lld type %lld\n", (long long)hdr->offset, (long long)chunk->type);
 	mtx_unlock(&shared_data->mutex);
 
-	unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (work->num_stripes - PARITY_STRIPE_COUNT);
+	unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (work->num_stripes - get_parity_stripes(work->type));
 	memset(work->bitmap, 0, max_checksums / CHAR_BIT);
 	struct btrfs_ioctl_search_key key;
 	memset(&key, 0 ,sizeof(key));
@@ -318,7 +348,7 @@ int main (int argc, char **argv) {
 	shared_data.producer_offset = 0;
 	shared_data.diskfds = devices;
 	for (int i = 0; WORK_ITEM_COUNT > i; i++) {
-		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * (shared_data.fsinfo.num_devices - PARITY_STRIPE_COUNT);
+		unsigned max_checksums = MAX_CHECKSUMS_PER_STRIPE * shared_data.fsinfo.num_devices;
 		shared_data.work[i].checksums = malloc(max_checksums * sizeof(shared_data.work[i].checksums[0]));
 		shared_data.work[i].bitmap = malloc(max_checksums / CHAR_BIT);
 		shared_data.work[i].disk_offsets = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].disk_offsets[0]));
