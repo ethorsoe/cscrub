@@ -26,6 +26,7 @@ static inline u32 cscrub_crc(u8 *data, int len) {
 }
 
 #define WORK_ITEM_COUNT 2
+#define MAX_INDEPENDENT_PARITY_STRIPES 2
 #define CSCRUB_AIO_INTERLEAVE_STAGES 2
 #define MAX_DEVID 1024
 #define CHECKSUMSIZE 4
@@ -40,6 +41,7 @@ struct scrub_io_ctx {
 struct shared_data;
 struct work_item_data {
 	struct scrub_io_ctx *io_contexts;
+	u8 *parity;
 	unsigned char *bitmap;
 	u32 *checksums;
 	u64 *disk_offsets;
@@ -112,8 +114,12 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 	const u64 stripe_ind_in_bg = iteration * (PARALLEL_BLOCK_SIZE / work->stripe_len) + phys_ind / stride;
 	const unsigned stripe_rotation = stripe_ind_in_bg % work->num_stripes;
 	u8 *rotated_buffers[work->num_stripes];
-	u8 parity[sector_size];
-	memset(parity, 0, sector_size);
+	u8 *parity[MAX_INDEPENDENT_PARITY_STRIPES];
+	parity[0] = work->parity + omp_get_thread_num() *
+		sector_size * MAX_INDEPENDENT_PARITY_STRIPES;
+	parity[1] = parity[0] + sector_size;
+	memset(parity[0], 0, sector_size +
+		((BTRFS_BLOCK_GROUP_RAID6 & work->type) ? sector_size : 0));
 	for (unsigned rot_ind = 0; rot_ind < work->num_stripes; rot_ind++)
 		rotated_buffers[rot_ind] = ctx->disk_buffers[(rot_ind + stripe_rotation) % work->num_stripes];
 	bool parity_valid = false;
@@ -124,7 +130,7 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 		// TODO add raid6 algebra here, others should just work
 		assert(!(BTRFS_BLOCK_GROUP_RAID6 & work->type));
 		for (unsigned i = 0; i < sector_size; i++) {
-			parity[i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
+			parity[0][i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
 		}
 		if (get_bit(work->bitmap, check_table_ind)) {
 			parity_valid = true;
@@ -138,8 +144,8 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 	}
 	// TODO add raid6 algebra here, others should just work
 	assert(!(BTRFS_BLOCK_GROUP_RAID6 & work->type));
-	for (unsigned stripe = log_per_phys; parity_valid && log_per_phys < work->num_stripes; stripe++) {
-		if (memcmp(parity, rotated_buffers[stripe] + phys_off_in_pblock, sector_size)) {
+	for (unsigned stripe = log_per_phys; parity_valid && stripe < work->num_stripes; stripe++) {
+		if (memcmp(parity[0], rotated_buffers[stripe] + phys_off_in_pblock, sector_size)) {
 			fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
 				(unsigned long long)(work->logical_offset),
 				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));
@@ -358,6 +364,9 @@ int main (int argc, char **argv) {
 		assert(shared_data.work[i].io_contexts);
 		shared_data.work[i].io_contexts[0].disk_buffers = malloc(CSCRUB_AIO_INTERLEAVE_STAGES * shared_data.fsinfo.num_devices * sizeof(u8*));
 		assert(shared_data.work[i].io_contexts[0].disk_buffers);
+		err = posix_memalign((void**)&shared_data.work[i].parity, sysconf(_SC_PAGESIZE),
+			MAX_INDEPENDENT_PARITY_STRIPES * shared_data.fsinfo.sectorsize * omp_threads);
+		assert(!err);
 		err = posix_memalign((void**)shared_data.work[i].io_contexts[0].disk_buffers, sysconf(_SC_PAGESIZE), CSCRUB_AIO_INTERLEAVE_STAGES * shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8));
 		assert(!err);
 		for (unsigned io_context = 0; io_context < CSCRUB_AIO_INTERLEAVE_STAGES; io_context++) {
@@ -400,6 +409,7 @@ int main (int argc, char **argv) {
 		free(shared_data.work[i].diskfds);
 		free(shared_data.work[i].io_contexts[0].disk_buffers[0]);
 		free(shared_data.work[i].io_contexts[0].disk_buffers);
+		free(shared_data.work[i].parity);
 		for (unsigned io_context = 0; io_context < CSCRUB_AIO_INTERLEAVE_STAGES; io_context++) {
 			io_destroy(shared_data.work[i].io_contexts[io_context].ctxp);
 		}
