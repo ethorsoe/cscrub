@@ -150,9 +150,10 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 		const u64 check_table_ind = (stripe_ind_in_bg * log_per_phys + check_disk) * stride + (phys_ind % stride);
 		const unsigned long long log_off_in_fs = check_table_ind * sector_size + work->logical_offset;
 
-		die_on(BTRFS_BLOCK_GROUP_RAID6 & work->type, "TODO: Raid 6 algebra not done\n");
-		for (unsigned i = 0; i < sector_size; i++) {
-			parity[0][i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
+		if (log_per_phys != work->num_stripes && !(BTRFS_BLOCK_GROUP_RAID6 & work->type)) {
+			for (unsigned i = 0; i < sector_size; i++) {
+				parity[0][i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
+			}
 		}
 		if (get_bit(work->bitmap, check_table_ind)) {
 			parity_valid = true;
@@ -167,9 +168,20 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 			}
 		}
 	}
-	die_on(BTRFS_BLOCK_GROUP_RAID6 & work->type, "TODO: Raid 6 algebra not done\n");
+	if (parity_valid && (BTRFS_BLOCK_GROUP_RAID6 & work->type)) {
+		void *raid6disks[work->num_stripes];
+		for (unsigned i = 0; i < log_per_phys; i++) {
+			raid6disks[i] = rotated_buffers[i] + phys_off_in_pblock;
+		}
+		raid6disks[log_per_phys] = parity[0];
+		raid6disks[log_per_phys + 1] = parity[1];
+		raid6_gen_syndrome(work->num_stripes, sector_size, raid6disks);
+	}
 	for (unsigned stripe = log_per_phys; parity_valid && stripe < work->num_stripes; stripe++) {
-		if (memcmp(parity[0], rotated_buffers[stripe] + phys_off_in_pblock, sector_size)) {
+		const unsigned stripe_select =
+			((BTRFS_BLOCK_GROUP_RAID6 & work->type) && log_per_phys != stripe) ? 1 : 0;
+		if (memcmp(parity[0 + stripe_select], rotated_buffers[stripe] + phys_off_in_pblock,
+				sector_size)) {
 			fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
 				(unsigned long long)(work->logical_offset),
 				(unsigned long long)(PARALLEL_BLOCK_SIZE * iteration + phys_off_in_pblock));

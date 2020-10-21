@@ -4,6 +4,7 @@ This is a tool to check btrfs checksums on whole filesystem.
 Supported data profiles
 * Single
 * BTRFS_BLOCK_GROUP_RAID5
+* BTRFS_BLOCK_GROUP_RAID6
 * BTRFS_BLOCK_GROUP_RAID0
 * BTRFS_BLOCK_GROUP_RAID1
 * BTRFS_BLOCK_GROUP_DUP (slow)
@@ -12,7 +13,6 @@ Supported data profiles
 
 Not supported
 raid10
-raid6 (algebra is missing)
 
 # Compilation
 * install libaio(-dev)
@@ -26,8 +26,6 @@ cscrub /mount/point
 # Caveats
 Dup profile checking is slow and seeky, as the code things the allocations are
 on different disks. Probably not worth fixing.
-
-Raid 6 support is missing algebra, pull requests welcome.
 
 The code is subject to race conditions causing false positives on disk
 stripes that see new writes during operation.
