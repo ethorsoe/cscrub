@@ -18,6 +18,7 @@
 #include <libaio.h>
 #include <omp.h>
 #include <malloc.h>
+#include <stdarg.h>
 #include "libbtrfs.h"
 
 #include "crc32c.h"
@@ -86,9 +87,26 @@ static inline void set_bits(u8 *data, u32 index, u32 len) {
 	}
 }
 
-void die(const char *msg) {
-	perror(msg);
+void vdie(const char *fmt, va_list args) {
+	const char *errmsg = strerror(errno);
+	vfprintf(stderr, fmt, args);
+	fprintf(stderr, "Error: %s\n", errmsg);
 	exit(EXIT_FAILURE);
+}
+void die(const char *fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	vdie(fmt, args);
+	va_end(args);
+}
+void die_on(bool condition, const char *fmt, ...) {
+	va_list args;
+	if (!condition) {
+		return;
+	}
+	va_start(args, fmt);
+	vdie(fmt, args);
+	va_end(args);
 }
 
 static inline unsigned get_parity_stripes(u32 type) {
@@ -101,7 +119,7 @@ static inline unsigned get_parity_stripes(u32 type) {
 	} else if (type & BTRFS_BLOCK_GROUP_RAID1C4) {
 		return 3;
 	}
-	die("Internal error, invalid block group accepted");
+	die("Internal error, invalid block group type %x accepted\n", type);
 	return -1;
 }
 
@@ -127,8 +145,7 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 		const u64 check_table_ind = (stripe_ind_in_bg * log_per_phys + check_disk) * stride + (phys_ind % stride);
 		const unsigned long long log_off_in_fs = check_table_ind * sector_size + work->logical_offset;
 
-		// TODO add raid6 algebra here, others should just work
-		assert(!(BTRFS_BLOCK_GROUP_RAID6 & work->type));
+		die_on(BTRFS_BLOCK_GROUP_RAID6 & work->type, "TODO: Raid 6 algebra not done\n");
 		for (unsigned i = 0; i < sector_size; i++) {
 			parity[0][i] ^= rotated_buffers[check_disk][i + phys_off_in_pblock];
 		}
@@ -142,8 +159,7 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 			}
 		}
 	}
-	// TODO add raid6 algebra here, others should just work
-	assert(!(BTRFS_BLOCK_GROUP_RAID6 & work->type));
+	die_on(BTRFS_BLOCK_GROUP_RAID6 & work->type, "TODO: Raid 6 algebra not done\n");
 	for (unsigned stripe = log_per_phys; parity_valid && stripe < work->num_stripes; stripe++) {
 		if (memcmp(parity[0], rotated_buffers[stripe] + phys_off_in_pblock, sector_size)) {
 			fprintf(stderr, "chunk at logical %llu parity at offset %llu wrong\n",
@@ -169,7 +185,7 @@ void start_read_parallel_block(struct work_item_data *work, unsigned iteration) 
 		iocbsp = iocbs + stripe;
 		io_prep_pread(iocbsp, work->diskfds[stripe], ctx->disk_buffers[stripe], pblock_phys_len, work->disk_offsets[stripe] + pblock_phys_off);
 		s64 err = io_submit(ctx->ctxp, 1, &iocbsp);
-		assert(1 == err);
+		die_on(1 != err, "aio submission on stripe %d failed\n", stripe);
 	}
 }
 void end_read_parallel_block(io_context_t ctxp, unsigned num_stripes, unsigned pblock_phys_len) {
@@ -177,9 +193,11 @@ void end_read_parallel_block(io_context_t ctxp, unsigned num_stripes, unsigned p
 
 	memset(io_events, 0, sizeof(io_events));
 	s64 err = io_getevents(ctxp, num_stripes, num_stripes, io_events, NULL);
-	assert(err == num_stripes);
+	die_on(err != num_stripes, "Only %d out of %d io events completed\n", err, num_stripes);
 	for (unsigned stripe = 0; stripe < num_stripes; stripe++) {
-		assert(pblock_phys_len == io_events[stripe].res);
+		die_on(pblock_phys_len != io_events[stripe].res,
+			"Short read %lld of %lld at stripe %d\n",
+			(long long)io_events[stripe].res, (long long)pblock_phys_len, stripe);
 	}
 }
 int consumer(void *private) {
@@ -277,12 +295,13 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 	work->stripe_len = chunk->stripe_len;
 	work->num_stripes = chunk->num_stripes;
 	work->type = chunk->type;
-	if (shared_data->fsinfo.num_devices < work->num_stripes)
-		die("max_stripes");
+	die_on(shared_data->fsinfo.num_devices < work->num_stripes,
+		"%d exceeds num devices %d\n", work->num_stripes,
+		shared_data->fsinfo.num_devices);
 	for (unsigned i = 0; i < work->num_stripes; i++) {
 		unsigned devid = stripes[i].devid;
-		if (MAX_DEVID <= devid)
-			die("devid");
+		die_on(MAX_DEVID <= devid || shared_data->diskfds[devid] == -1,
+			"Unknown devid %u\n", devid);
 		work->diskfds[i] = shared_data->diskfds[devid];
 		work->disk_offsets[i] = stripes[i].offset;
 	}
@@ -312,16 +331,14 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 
 int main (int argc, char **argv) {
 	const unsigned omp_threads = omp_get_max_threads();
-	int devices[MAX_DEVID]; 
-	if (argc != 2)
-		die("usage: aa <filename>");
+	int devices[MAX_DEVID];
 	struct shared_data shared_data;
+
+	die_on(argc != 2, "usage: %s <mount point>\n", argv[0]);
 	shared_data.mountfd = open(argv[1], O_RDONLY);
-	if (0 > shared_data.mountfd)
-		die("open");
+	die_on(0 > shared_data.mountfd, "Mount point open failed\n");
 	int err = ioctl(shared_data.mountfd, BTRFS_IOC_FS_INFO, &shared_data.fsinfo);
-	if (0 > err)
-		die("fsinfo");
+	die_on(0 > err, "fsinfo ioctl failed\n");
 	printf("fs UUID=");
 	for (int i = 0; i < BTRFS_FSID_SIZE; i++)
 		printf("%.2x", shared_data.fsinfo.fsid[i]);
@@ -335,18 +352,16 @@ int main (int argc, char **argv) {
 		err = ioctl(shared_data.mountfd, BTRFS_IOC_DEV_INFO, &devinfo);
 		if (0 > err && ENODEV == errno)
 			continue;
-		if (0 > err)
-			die("devinfo");
+		die_on(0 > err, "devinfo ioctl failed\n");
 		printf("found device %lld %.*s\n", (long long)devinfo.devid,
 			BTRFS_DEVICE_PATH_NAME_MAX, (char*)devinfo.path);
 		devices_found++;
 		int tempfd = open((char*)devinfo.path, O_RDONLY|O_DIRECT);
-		if (0 > tempfd)
-			die("open dev");
+		die_on(0 > tempfd, "Opening device %s failed\n", devinfo.path);
 		devices[i] = tempfd;
 	}
-	if (devices_found < shared_data.fsinfo.num_devices)
-		die("some devices not found");
+	die_on(devices_found < shared_data.fsinfo.num_devices, "Expected %d devices, found %d\n",
+		shared_data.fsinfo.num_devices, devices_found);
 
 	mtx_init(&shared_data.mutex, mtx_plain);
 	cnd_init(&shared_data.condition);
@@ -361,17 +376,17 @@ int main (int argc, char **argv) {
 		shared_data.work[i].diskfds = malloc(shared_data.fsinfo.num_devices * sizeof(shared_data.work[i].diskfds[0]));
 		shared_data.work[i].parent = &shared_data;
 		shared_data.work[i].io_contexts = calloc(CSCRUB_AIO_INTERLEAVE_STAGES, sizeof(shared_data.work[i].io_contexts[0]));
-		assert(shared_data.work[i].io_contexts);
+		die_on(!shared_data.work[i].io_contexts, "Out of memory\n");
 		shared_data.work[i].io_contexts[0].disk_buffers = malloc(CSCRUB_AIO_INTERLEAVE_STAGES * shared_data.fsinfo.num_devices * sizeof(u8*));
-		assert(shared_data.work[i].io_contexts[0].disk_buffers);
+		die_on(!shared_data.work[i].io_contexts[0].disk_buffers, "Out of memory\n");
 		err = posix_memalign((void**)&shared_data.work[i].parity, sysconf(_SC_PAGESIZE),
 			MAX_INDEPENDENT_PARITY_STRIPES * shared_data.fsinfo.sectorsize * omp_threads);
-		assert(!err);
+		die_on(err, "Out of memory\n");
 		err = posix_memalign((void**)shared_data.work[i].io_contexts[0].disk_buffers, sysconf(_SC_PAGESIZE), CSCRUB_AIO_INTERLEAVE_STAGES * shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8));
-		assert(!err);
+		die_on(err, "Out of memory\n");
 		for (unsigned io_context = 0; io_context < CSCRUB_AIO_INTERLEAVE_STAGES; io_context++) {
 			err = io_setup(shared_data.fsinfo.num_devices, &shared_data.work[i].io_contexts[io_context].ctxp);
-			assert(!err);
+			die_on(err, "Out of memory\n");
 			shared_data.work[i].io_contexts[io_context].disk_buffers =
 				shared_data.work[i].io_contexts[0].disk_buffers + io_context * shared_data.fsinfo.num_devices;
 			shared_data.work[i].io_contexts[io_context].disk_buffers[0] =
