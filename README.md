@@ -13,6 +13,11 @@ Supported data profiles
 * install libaio(-dev)
 * gcc -o cscrub -O2 -fopenmp -Wall -Wextra -pedantic -std=c11 *.c -lpthread -laio
 
+# Usage
+```bash
+cscrub /mount/point
+```
+
 # Caveats
 Only data checksums are supported, supporting metadata
 would be possible, but as using raid5 metadata is not sane, support
