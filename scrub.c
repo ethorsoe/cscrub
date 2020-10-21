@@ -131,7 +131,7 @@ void check_parallel_block(struct work_item_data *work, unsigned iteration, unsig
 	const unsigned meta_space = (BTRFS_BLOCK_GROUP_DATA & work->type) ?
 		0 : CHECKSUM_SPACE_IN_META_NODE;
 	const unsigned sector_size = (meta_space) ?
-		work->parent->fsinfo.sectorsize : work->parent->fsinfo.nodesize;
+		work->parent->fsinfo.nodesize : work->parent->fsinfo.sectorsize;
 	const unsigned stride = work->stripe_len / sector_size;
 	const u64 phys_off_in_pblock = phys_ind * sector_size;
 	const u64 stripe_ind_in_bg = iteration * (PARALLEL_BLOCK_SIZE / work->stripe_len) + phys_ind / stride;
