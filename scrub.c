@@ -111,7 +111,8 @@ void die_on(bool condition, const char *fmt, ...) {
 }
 
 static inline unsigned get_parity_stripes(u32 type) {
-	if (!(type & BTRFS_BLOCK_GROUP_PROFILE_MASK)) {
+	if (!(type & BTRFS_BLOCK_GROUP_PROFILE_MASK &
+			~BTRFS_BLOCK_GROUP_RAID0)) {
 		return 0;
 	} else if (type & (BTRFS_BLOCK_GROUP_RAID5|BTRFS_BLOCK_GROUP_RAID1|BTRFS_BLOCK_GROUP_DUP)) {
 		return 1;
