@@ -28,3 +28,11 @@ stripes that see new writes during operation.
 
 Currently only checksum checking is implemented and other means have to
 be used for repair, like file rewrites.
+
+# Reporting bugs
+Currently github is used to track bugs.
+
+Unless the bug is quite obvious, attach at least output of
+```bash
+btrfs inspect-internal dump-tree -t 3 /dev/mapper/home
+```
