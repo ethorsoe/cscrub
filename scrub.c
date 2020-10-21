@@ -417,8 +417,12 @@ int main (int argc, char **argv) {
 		err = posix_memalign((void**)&shared_data.work[i].parity, sysconf(_SC_PAGESIZE),
 			MAX_INDEPENDENT_PARITY_STRIPES * shared_data.fsinfo.sectorsize * omp_threads);
 		die_on(err, "Out of memory\n");
-		err = posix_memalign((void**)shared_data.work[i].io_contexts[0].disk_buffers, sysconf(_SC_PAGESIZE), CSCRUB_AIO_INTERLEAVE_STAGES * shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8));
+		const size_t disk_buffers_size = CSCRUB_AIO_INTERLEAVE_STAGES *
+			shared_data.fsinfo.num_devices * PARALLEL_BLOCK_SIZE * sizeof(u8);
+		err = posix_memalign((void**)shared_data.work[i].io_contexts[0].disk_buffers,
+			sysconf(_SC_PAGESIZE), disk_buffers_size);
 		die_on(err, "Out of memory\n");
+		memset(shared_data.work[i].io_contexts[0].disk_buffers[0], 0, disk_buffers_size);
 		for (unsigned io_context = 0; io_context < CSCRUB_AIO_INTERLEAVE_STAGES; io_context++) {
 			err = io_setup(shared_data.fsinfo.num_devices, &shared_data.work[i].io_contexts[io_context].ctxp);
 			die_on(err, "Out of memory\n");
