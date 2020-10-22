@@ -37,6 +37,9 @@ using some more stable slow path. Checksums could be repaired by relocating
 the block group with balance, reading the file (if appropriate) or rewriting
 the file contents and using EXTENT_SAME ioctl to replace the broken data.
 
+Big endian is not supported, adding support is trivial but would require at least
+testing.
+
 # Reporting bugs
 Currently github is used to track bugs.
 
