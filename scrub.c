@@ -124,6 +124,9 @@ static inline unsigned get_parity_stripes(u32 type) {
 	die("Internal error, invalid block group type %x accepted\n", type);
 	return -1;
 }
+static u64 checksum_spread_in_meta_node(u32 sector_size, u32 node_size) {
+	return node_size * sector_size / CHECKSUMSIZE;
+}
 
 void check_parallel_block(struct work_item_data *work, unsigned iteration, unsigned phys_ind) {
 	struct scrub_io_ctx const *ctx = (work->io_contexts + iteration % CSCRUB_AIO_INTERLEAVE_STAGES);
@@ -350,7 +353,8 @@ int chunk_callback(void* data, struct btrfs_ioctl_search_header* hdr, void *priv
 		key.max_objectid = BTRFS_EXTENT_CSUM_OBJECTID;
 		key.min_type = BTRFS_EXTENT_CSUM_KEY;
 		key.max_type = BTRFS_EXTENT_CSUM_KEY;
-		key.min_offset = work->logical_offset - shared_data->fsinfo.nodesize;
+		key.min_offset = work->logical_offset - checksum_spread_in_meta_node(
+			shared_data->fsinfo.nodesize, shared_data->fsinfo.nodesize);
 		key.max_offset = work->logical_offset + work->length - 1;
 		key.max_transid = -1ULL;
 		btrfs_iterate_tree(shared_data->mountfd, BTRFS_CSUM_TREE_OBJECTID, work, search_checksum_cb, &key);
