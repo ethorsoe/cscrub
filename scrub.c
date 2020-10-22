@@ -125,7 +125,9 @@ static inline unsigned get_parity_stripes(u32 type) {
 	return -1;
 }
 static u64 checksum_spread_in_meta_node(u32 sector_size, u32 node_size) {
-	return node_size * sector_size / CHECKSUMSIZE;
+	assert(64 * 1024 <= sector_size);
+	assert(64 * 1024 <= node_size);
+	return node_size * (sector_size / CHECKSUMSIZE);
 }
 
 void check_parallel_block(struct work_item_data *work, unsigned iteration, unsigned phys_ind) {
